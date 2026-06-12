@@ -108,3 +108,40 @@
   - layer별 shape에 맞춘 specialized kernel 분리
   - vectorized load 적용
   - 여러 GPU로 batch를 나누는 multi-GPU 분산
+
+## Step 8: 단일 노드 Multi-GPU Batch Split
+- 기존 `predict_sentiment(...)`는 rank 0에서 GPU 0 하나만 사용해 전체 `n_samples`를 처리했다.
+- 이번 단계에서는 사용 가능한 GPU 수를 확인한 뒤 최대 4개 GPU를 사용하도록 변경했다.
+  - `cudaGetDeviceCount(...)`로 실제 GPU 개수를 확인한다.
+  - `Tensor::MAX_GPU_BUFS`가 4이므로 active GPU 수도 최대 4로 제한한다.
+  - sample 수보다 GPU 수가 많으면 sample 수만큼만 GPU를 사용한다.
+
+- 전체 batch를 GPU 개수만큼 나누어 chunk를 만든다.
+  - `base_chunk = n_samples / active_gpus`
+  - `remainder = n_samples % active_gpus`
+  - 앞쪽 GPU들이 remainder를 하나씩 더 가져간다.
+- 각 GPU는 자기 chunk의 시작 위치 `chunk_start[gpu]`와 크기 `chunk_size[gpu]`를 가진다.
+
+- GPU마다 독립 workspace를 할당한다.
+  - `d_inputs[gpu]`
+  - `d_permute[gpu]`
+  - `d_concat[gpu]`
+  - `d_linear0[gpu]`
+  - `d_linear1[gpu]`
+  - `d_linear2[gpu]`
+  - `d_outputs[gpu]`
+- host input에서는 `inputs + chunk_start[gpu] * SEQ_LEN` 위치부터 해당 GPU chunk만 복사한다.
+
+- 각 GPU에서 기존 batch CUDA 함수들을 그대로 호출한다.
+  - `EmbeddingPermuteBatchCUDA(...)`
+  - `Conv1DReLUMaxBatchCUDA(...)` 4개 branch
+  - `LinearBatchCUDA(...)` 4개 linear layer
+- 함수 호출 시 `device_id`를 GPU 번호로 넘겨 각 GPU에 상주한 parameter buffer를 사용한다.
+- kernel launch 전에는 `cudaSetDevice(gpu)`로 현재 device를 맞춘다.
+
+- 모든 GPU에 kernel launch를 끝낸 뒤, GPU별 output chunk를 host `outputs`의 원래 위치로 복사한다.
+  - `outputs + chunk_start[gpu] * N_CLASSES`
+- 마지막에는 GPU별 workspace를 해제하고 기존 device로 복구한다.
+
+- 이 단계는 아직 CUDA stream을 명시적으로 사용하지 않는다.
+- 다음 최적화 후보는 GPU별 stream을 만들어 H2D copy, kernel execution, D2H copy를 더 명확하게 overlap하는 것이다.

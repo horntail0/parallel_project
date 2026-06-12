@@ -151,77 +151,112 @@ void predict_sentiment(int *inputs, float *outputs, size_t n_samples) {
     if (n_samples == 0) return;
 
     int prev_device = 0;
+    int device_count = 0;
     CHECK_CUDA(cudaGetDevice(&prev_device));
-    CHECK_CUDA(cudaSetDevice(0));
+    CHECK_CUDA(cudaGetDeviceCount(&device_count));
 
-    int *d_inputs = nullptr;
-    float *d_permute = nullptr;
-    float *d_concat = nullptr;
-    float *d_linear0 = nullptr;
-    float *d_linear1 = nullptr;
-    float *d_linear2 = nullptr;
-    float *d_outputs = nullptr;
+    int active_gpus = device_count < Tensor::MAX_GPU_BUFS ?
+                      device_count : Tensor::MAX_GPU_BUFS;
+    if (active_gpus > (int) n_samples) active_gpus = (int) n_samples;
+    if (active_gpus <= 0) {
+      fprintf(stderr, "No CUDA device available\n");
+      exit(EXIT_FAILURE);
+    }
 
-    size_t input_bytes = n_samples * SEQ_LEN * sizeof(int);
-    size_t permute_bytes = n_samples * EMBEDDING_DIM * SEQ_LEN * sizeof(float);
-    size_t concat_bytes = n_samples * N_FILTERS * 4 * sizeof(float);
-    size_t linear0_bytes = n_samples * 2048 * sizeof(float);
-    size_t linear1_bytes = n_samples * 1024 * sizeof(float);
-    size_t linear2_bytes = n_samples * 512 * sizeof(float);
-    size_t output_bytes = n_samples * N_CLASSES * sizeof(float);
+    int *d_inputs[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
+    float *d_permute[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
+    float *d_concat[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
+    float *d_linear0[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
+    float *d_linear1[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
+    float *d_linear2[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
+    float *d_outputs[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
+    size_t chunk_start[Tensor::MAX_GPU_BUFS] = {0, 0, 0, 0};
+    size_t chunk_size[Tensor::MAX_GPU_BUFS] = {0, 0, 0, 0};
 
-    CHECK_CUDA(cudaMalloc(&d_inputs, input_bytes));
-    CHECK_CUDA(cudaMalloc(&d_permute, permute_bytes));
-    CHECK_CUDA(cudaMalloc(&d_concat, concat_bytes));
-    CHECK_CUDA(cudaMalloc(&d_linear0, linear0_bytes));
-    CHECK_CUDA(cudaMalloc(&d_linear1, linear1_bytes));
-    CHECK_CUDA(cudaMalloc(&d_linear2, linear2_bytes));
-    CHECK_CUDA(cudaMalloc(&d_outputs, output_bytes));
+    size_t base_chunk = n_samples / active_gpus;
+    size_t remainder = n_samples % active_gpus;
+    size_t start = 0;
 
-    CHECK_CUDA(cudaMemcpy(d_inputs, inputs, input_bytes,
-                          cudaMemcpyHostToDevice));
+    for (int gpu = 0; gpu < active_gpus; gpu++) {
+      size_t batch = base_chunk + (gpu < (int) remainder ? 1 : 0);
+      chunk_start[gpu] = start;
+      chunk_size[gpu] = batch;
+      start += batch;
 
-    /* in [SEQ_LEN] -> out [SEQ_LEN, 4096] */
-    /* in [SEQ_LEN, 4096] -> out [4096, SEQ_LEN] */
-    EmbeddingPermuteBatchCUDA(d_inputs, emb_w, d_permute, n_samples, 0);
+      size_t input_bytes = batch * SEQ_LEN * sizeof(int);
+      size_t permute_bytes = batch * EMBEDDING_DIM * SEQ_LEN * sizeof(float);
+      size_t concat_bytes = batch * N_FILTERS * 4 * sizeof(float);
+      size_t linear0_bytes = batch * 2048 * sizeof(float);
+      size_t linear1_bytes = batch * 1024 * sizeof(float);
+      size_t linear2_bytes = batch * 512 * sizeof(float);
+      size_t output_bytes = batch * N_CLASSES * sizeof(float);
 
-    /* in [4096, SEQ_LEN] -> out [1024, SEQ_LEN - n]  n == 2, 4, 6..*/
-    /* in [1024, SEQ_LEN - 2] -> out [1024] */
-    Conv1DReLUMaxBatchCUDA(d_permute, conv0_w, conv0_b, d_concat,
-                           n_samples, 0, 0);
-    Conv1DReLUMaxBatchCUDA(d_permute, conv1_w, conv1_b, d_concat,
-                           n_samples, N_FILTERS, 0);
-    Conv1DReLUMaxBatchCUDA(d_permute, conv2_w, conv2_b, d_concat,
-                           n_samples, N_FILTERS * 2, 0);
-    Conv1DReLUMaxBatchCUDA(d_permute, conv3_w, conv3_b, d_concat,
-                           n_samples, N_FILTERS * 3, 0);
+      CHECK_CUDA(cudaSetDevice(gpu));
+      CHECK_CUDA(cudaMalloc(&d_inputs[gpu], input_bytes));
+      CHECK_CUDA(cudaMalloc(&d_permute[gpu], permute_bytes));
+      CHECK_CUDA(cudaMalloc(&d_concat[gpu], concat_bytes));
+      CHECK_CUDA(cudaMalloc(&d_linear0[gpu], linear0_bytes));
+      CHECK_CUDA(cudaMalloc(&d_linear1[gpu], linear1_bytes));
+      CHECK_CUDA(cudaMalloc(&d_linear2[gpu], linear2_bytes));
+      CHECK_CUDA(cudaMalloc(&d_outputs[gpu], output_bytes));
 
-    /* in [1024 * 4] -> out [2048] */
-    LinearBatchCUDA(d_concat, linear0_w, linear0_b, d_linear0,
-                    n_samples, true, 0);
+      CHECK_CUDA(cudaMemcpy(d_inputs[gpu], inputs + chunk_start[gpu] * SEQ_LEN,
+                            input_bytes, cudaMemcpyHostToDevice));
 
-    /* in [2048] -> out [1024] */
-    LinearBatchCUDA(d_linear0, linear1_w, linear1_b, d_linear1,
-                    n_samples, true, 0);
+      /* in [SEQ_LEN] -> out [SEQ_LEN, 4096] */
+      /* in [SEQ_LEN, 4096] -> out [4096, SEQ_LEN] */
+      EmbeddingPermuteBatchCUDA(d_inputs[gpu], emb_w, d_permute[gpu],
+                                batch, gpu);
 
-    /* in [1024] -> out [512] */
-    LinearBatchCUDA(d_linear1, linear2_w, linear2_b, d_linear2,
-                    n_samples, true, 0);
+      /* in [4096, SEQ_LEN] -> out [1024, SEQ_LEN - n]  n == 2, 4, 6..*/
+      /* in [1024, SEQ_LEN - 2] -> out [1024] */
+      Conv1DReLUMaxBatchCUDA(d_permute[gpu], conv0_w, conv0_b, d_concat[gpu],
+                             batch, 0, gpu);
+      Conv1DReLUMaxBatchCUDA(d_permute[gpu], conv1_w, conv1_b, d_concat[gpu],
+                             batch, N_FILTERS, gpu);
+      Conv1DReLUMaxBatchCUDA(d_permute[gpu], conv2_w, conv2_b, d_concat[gpu],
+                             batch, N_FILTERS * 2, gpu);
+      Conv1DReLUMaxBatchCUDA(d_permute[gpu], conv3_w, conv3_b, d_concat[gpu],
+                             batch, N_FILTERS * 3, gpu);
 
-    /* in [512] -> out [2] */
-    LinearBatchCUDA(d_linear2, linear3_w, linear3_b, d_outputs,
-                    n_samples, false, 0);
+      /* in [1024 * 4] -> out [2048] */
+      LinearBatchCUDA(d_concat[gpu], linear0_w, linear0_b, d_linear0[gpu],
+                      batch, true, gpu);
 
-    CHECK_CUDA(cudaMemcpy(outputs, d_outputs, output_bytes,
-                          cudaMemcpyDeviceToHost));
+      /* in [2048] -> out [1024] */
+      LinearBatchCUDA(d_linear0[gpu], linear1_w, linear1_b, d_linear1[gpu],
+                      batch, true, gpu);
 
-    CHECK_CUDA(cudaFree(d_outputs));
-    CHECK_CUDA(cudaFree(d_linear2));
-    CHECK_CUDA(cudaFree(d_linear1));
-    CHECK_CUDA(cudaFree(d_linear0));
-    CHECK_CUDA(cudaFree(d_concat));
-    CHECK_CUDA(cudaFree(d_permute));
-    CHECK_CUDA(cudaFree(d_inputs));
+      /* in [1024] -> out [512] */
+      LinearBatchCUDA(d_linear1[gpu], linear2_w, linear2_b, d_linear2[gpu],
+                      batch, true, gpu);
+
+      /* in [512] -> out [2] */
+      LinearBatchCUDA(d_linear2[gpu], linear3_w, linear3_b, d_outputs[gpu],
+                      batch, false, gpu);
+    }
+
+    for (int gpu = 0; gpu < active_gpus; gpu++) {
+      size_t batch = chunk_size[gpu];
+      size_t output_bytes = batch * N_CLASSES * sizeof(float);
+
+      CHECK_CUDA(cudaSetDevice(gpu));
+      CHECK_CUDA(cudaMemcpy(outputs + chunk_start[gpu] * N_CLASSES,
+                            d_outputs[gpu], output_bytes,
+                            cudaMemcpyDeviceToHost));
+    }
+
+    for (int gpu = 0; gpu < active_gpus; gpu++) {
+      CHECK_CUDA(cudaSetDevice(gpu));
+      CHECK_CUDA(cudaFree(d_outputs[gpu]));
+      CHECK_CUDA(cudaFree(d_linear2[gpu]));
+      CHECK_CUDA(cudaFree(d_linear1[gpu]));
+      CHECK_CUDA(cudaFree(d_linear0[gpu]));
+      CHECK_CUDA(cudaFree(d_concat[gpu]));
+      CHECK_CUDA(cudaFree(d_permute[gpu]));
+      CHECK_CUDA(cudaFree(d_inputs[gpu]));
+    }
+
     CHECK_CUDA(cudaSetDevice(prev_device));
   }
 }
