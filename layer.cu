@@ -1,4 +1,5 @@
 #include "layer.h"
+#include "model.h"
 
 
 /* Embedding
@@ -48,6 +49,33 @@ void EmbeddingPermute(int *in, Tensor *w, Tensor *out) {
       out->buf[j * s + i] = w->buf[in[i] * H + j];
     }
   }
+}
+
+__global__ void EmbeddingPermuteBatchKernel(const int *inputs,
+                                            const float *emb,
+                                            float *out,
+                                            size_t batch) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x; // 결과 out 의 위치를 1차원적으로 생각했을 때 인덱스.
+  // index 는 그냥 일차원적으로 생각되지만 이 위치를 3차원적으로 생각하면 sample 번째 문장, hidden 번째 임베딩 float, seq번째 토큰 위치로 생각할 수 있다.
+  size_t total = batch * EMBEDDING_DIM * SEQ_LEN;
+  if (idx >= total) return;
+
+  size_t seq = idx % SEQ_LEN; // 문장안에서의 토큰 위치
+  size_t hidden = (idx / SEQ_LEN) % EMBEDDING_DIM; // 임베딩 차원에서의 위치. 4096임베딩 float 중 몇번째인지.
+  size_t sample = idx / (EMBEDDING_DIM * SEQ_LEN); // 배치에서의 샘플 위치. n번째 문장.
+  int token = inputs[sample * SEQ_LEN + seq]; // sample 번째 입력문장의 seq 번째 토큰.
+  // out[sample][hidden][seq] = emb[token][hidden] // 이 token의 hidden 번째 임베딩 float이 out의 sample 번째 문장에서 행과 열이 바뀌어서 들어감.
+  // 즉, 원래 embedding 에서의 위치가 열이었는데 그게 행이 되고, 토큰 위치가 원래 행이였는데 열이 됨.
+  // 이것은 sample * (SEQ_LEN * EMBEDDING_DIM) + hidden * SEQ_LEN + seq 로 계산됨.
+  out[idx] = emb[token * EMBEDDING_DIM + hidden];
+}
+
+void EmbeddingPermuteBatchCUDA(int *d_inputs, Tensor *w, float *d_permute,
+                               size_t batch, int device_id) {
+  size_t total = batch * EMBEDDING_DIM * SEQ_LEN;
+  EmbeddingPermuteBatchKernel<<<(total + 255) / 256, 256>>>(
+      d_inputs, w->device_buf(device_id), d_permute, batch);
+  CHECK_CUDA(cudaGetLastError());
 }
 
 /* Conv1D
@@ -119,6 +147,48 @@ void Conv1DReLUMax(Tensor *in, Tensor *w, Tensor *b, Tensor *out) {
     }
     out->buf[i] = max_val;
   }
+}
+
+__global__ void Conv1DReLUMaxBatchKernel(const float *in, const float *w,
+                                         const float *bias, float *concat,
+                                         size_t batch, size_t K,
+                                         size_t out_offset) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = batch * N_FILTERS;
+  if (idx >= total) return;
+
+  size_t sample = idx / N_FILTERS; // 몇번째 문장인가
+  size_t oc = idx % N_FILTERS; // 몇번째 필터인가. oc는 out의 채널 위치이기도 함.
+  size_t os = SEQ_LEN - K + 1; // conv 거치고 나오는 sequence 길이. os는 out의 시퀀스 위치이기도 함.
+  float max_val = 0.f;
+
+  for (size_t pos = 0; pos < os; pos++) {
+    float val = 0.f;
+    for (size_t c = 0; c < EMBEDDING_DIM; c++) {
+      for (size_t k = 0; k < K; k++) {
+        // val += in[sample][c][pos+k] * w[oc][c][k]
+        // in sample번째 문장의 c번 임베딩차원의 pos+k 번째 토큰 위치 값과 w의 oc번째 필터의 c번 채널의 k번째 커널 위치 값 곱해서 더하기.
+        val += in[sample * EMBEDDING_DIM * SEQ_LEN + c * SEQ_LEN + pos + k] *
+               w[oc * EMBEDDING_DIM * K + c * K + k];
+      }
+    }
+    val += bias[oc];
+    if (val > max_val) max_val = val;
+  }
+
+  concat[sample * (N_FILTERS * 4) + out_offset + oc] = max_val;
+}
+
+void Conv1DReLUMaxBatchCUDA(float *d_in, Tensor *w, Tensor *b,
+                            float *d_concat, size_t batch,
+                            size_t out_offset, int device_id) {
+  size_t total = batch * N_FILTERS;
+  size_t K = w->shape[2]; // w의 shape는 [OC, C, K]이므로 w->shape[2]는 K가 됨.
+  // OC = N_FILTERES, C = EMBEDDING_DIM, K = 3, 5, 7, or 9.
+  Conv1DReLUMaxBatchKernel<<<(total + 255) / 256, 256>>>(
+      d_in, w->device_buf(device_id), b->device_buf(device_id), d_concat,
+      batch, K, out_offset);
+  CHECK_CUDA(cudaGetLastError());
 }
 
 /* ReLU

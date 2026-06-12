@@ -47,3 +47,27 @@
 
 - 아직 `n_samples` loop는 유지한다.
 - 이번 단계는 batch화 전, 중간 activation 저장과 layer 호출 수를 줄이는 fused CPU 기준 변경이다.
+
+## Step 4: Embedding/Conv Branch Batch GPU화
+
+- `layer.cu`에 `EmbeddingPermuteBatchCUDA(...)`를 추가했다.
+- 이 함수는 전체 batch 입력 `[B, SEQ_LEN]`을 받아 GPU에서 `[B, EMBEDDING_DIM, SEQ_LEN]` layout을 만든다.
+- index mapping은 다음과 같다.
+  - `d_permute[b, h, s] = emb_w[input[b, s], h]`
+
+- `layer.cu`에 `Conv1DReLUMaxBatchCUDA(...)`를 추가했다.
+- 이 함수는 batch 전체에 대해 Conv1D, ReLU, MaxPool을 하나의 CUDA kernel에서 수행한다.
+- 각 conv branch 결과는 별도 pool buffer를 거치지 않고 `d_concat[b, offset + oc]`에 바로 저장한다.
+  - conv0 offset: `0`
+  - conv1 offset: `N_FILTERS`
+  - conv2 offset: `N_FILTERS * 2`
+  - conv3 offset: `N_FILTERS * 3`
+
+- `model.cu`의 `predict_sentiment(...)`는 rank 0에서 GPU 0 workspace를 한 번 할당한다.
+  - `d_inputs`: `[n_samples, SEQ_LEN]`
+  - `d_permute`: `[n_samples, EMBEDDING_DIM, SEQ_LEN]`
+  - `d_concat`: `[n_samples, N_FILTERS * 4]`
+  - `concat_batch`: host pinned buffer `[n_samples, N_FILTERS * 4]`
+- GPU에서 Embedding/Permute와 conv branch 4개를 batch로 처리한 뒤, `d_concat`을 host로 복사한다.
+- Linear layers는 아직 CPU에서 sample별로 처리한다.
+- 이 단계부터 `n_samples` loop는 Linear 계산에만 남는다.

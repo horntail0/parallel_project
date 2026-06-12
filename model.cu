@@ -1,6 +1,8 @@
 #include <mpi.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include "layer.h"
 #include "model.h"
@@ -146,25 +148,50 @@ void predict_sentiment(int *inputs, float *outputs, size_t n_samples) {
   int mpi_rank;
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   if (mpi_rank == 0) {
-    /* Predict sentiment for each sentence */
+    if (n_samples == 0) return;
+
+    int prev_device = 0;
+    CHECK_CUDA(cudaGetDevice(&prev_device));
+    CHECK_CUDA(cudaSetDevice(0));
+
+    int *d_inputs = nullptr;
+    float *d_permute = nullptr;
+    float *d_concat = nullptr;
+    float *concat_batch = nullptr;
+
+    size_t input_bytes = n_samples * SEQ_LEN * sizeof(int);
+    size_t permute_bytes = n_samples * EMBEDDING_DIM * SEQ_LEN * sizeof(float);
+    size_t concat_bytes = n_samples * N_FILTERS * 4 * sizeof(float);
+
+    CHECK_CUDA(cudaMalloc(&d_inputs, input_bytes));
+    CHECK_CUDA(cudaMalloc(&d_permute, permute_bytes));
+    CHECK_CUDA(cudaMalloc(&d_concat, concat_bytes));
+    CHECK_CUDA(cudaMallocHost((void **) &concat_batch, concat_bytes));
+
+    CHECK_CUDA(cudaMemcpy(d_inputs, inputs, input_bytes,
+                          cudaMemcpyHostToDevice));
+
+    /* in [SEQ_LEN] -> out [SEQ_LEN, 4096] */
+    /* in [SEQ_LEN, 4096] -> out [4096, SEQ_LEN] */
+    EmbeddingPermuteBatchCUDA(d_inputs, emb_w, d_permute, n_samples, 0);
+
+    /* in [4096, SEQ_LEN] -> out [1024, SEQ_LEN - n]  n == 2, 4, 6..*/
+    /* in [1024, SEQ_LEN - 2] -> out [1024] */
+    Conv1DReLUMaxBatchCUDA(d_permute, conv0_w, conv0_b, d_concat,
+                           n_samples, 0, 0);
+    Conv1DReLUMaxBatchCUDA(d_permute, conv1_w, conv1_b, d_concat,
+                           n_samples, N_FILTERS, 0);
+    Conv1DReLUMaxBatchCUDA(d_permute, conv2_w, conv2_b, d_concat,
+                           n_samples, N_FILTERS * 2, 0);
+    Conv1DReLUMaxBatchCUDA(d_permute, conv3_w, conv3_b, d_concat,
+                           n_samples, N_FILTERS * 3, 0);
+    CHECK_CUDA(cudaMemcpy(concat_batch, d_concat, concat_bytes,
+                          cudaMemcpyDeviceToHost));
+
+    /* Linear layers are still computed on CPU for a clear validation point. */
     for (size_t n = 0; n < n_samples; n++) {
-      /* Load a sentence from the inputs */
-      int *single_input = inputs + n * SEQ_LEN;
-
-      /* in [SEQ_LEN] -> out [4096, SEQ_LEN] */
-      EmbeddingPermute(single_input, emb_w, permute_a);
-
-      /* in [4096, SEQ_LEN] -> out [1024] */
-      Conv1DReLUMax(permute_a, conv0_w, conv0_b, pool0_a);
-      Conv1DReLUMax(permute_a, conv1_w, conv1_b, pool1_a);
-      Conv1DReLUMax(permute_a, conv2_w, conv2_b, pool2_a);
-      Conv1DReLUMax(permute_a, conv3_w, conv3_b, pool3_a);
-
-      /* in [1024] +
-            [1024] +
-            [1024] +
-            [1024] -> out [1024 * 4] */
-      Concat(pool0_a, pool1_a, pool2_a, pool3_a, concat_a);
+      memcpy(concat_a->buf, concat_batch + n * N_FILTERS * 4,
+             N_FILTERS * 4 * sizeof(float));
 
       /* in [1024 * 4] -> out [2048] */
       LinearReLU(concat_a, linear0_w, linear0_b, linear0_a);
@@ -186,5 +213,11 @@ void predict_sentiment(int *inputs, float *outputs, size_t n_samples) {
       /* Copy the computation result to the outputs */
       memcpy(outputs + n * 2, linear3_a->buf, 2 * sizeof(float));
     }
+
+    CHECK_CUDA(cudaFreeHost(concat_batch));
+    CHECK_CUDA(cudaFree(d_concat));
+    CHECK_CUDA(cudaFree(d_permute));
+    CHECK_CUDA(cudaFree(d_inputs));
+    CHECK_CUDA(cudaSetDevice(prev_device));
   }
 }
