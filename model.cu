@@ -170,6 +170,9 @@ void predict_sentiment(int *inputs, float *outputs, size_t n_samples) {
     float *d_linear1[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
     float *d_linear2[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
     float *d_outputs[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
+    int *h_inputs_pinned[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
+    float *h_outputs_pinned[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
+    cudaStream_t streams[Tensor::MAX_GPU_BUFS] = {nullptr, nullptr, nullptr, nullptr};
     size_t chunk_start[Tensor::MAX_GPU_BUFS] = {0, 0, 0, 0};
     size_t chunk_size[Tensor::MAX_GPU_BUFS] = {0, 0, 0, 0};
 
@@ -192,6 +195,9 @@ void predict_sentiment(int *inputs, float *outputs, size_t n_samples) {
       size_t output_bytes = batch * N_CLASSES * sizeof(float);
 
       CHECK_CUDA(cudaSetDevice(gpu));
+      CHECK_CUDA(cudaStreamCreate(&streams[gpu]));
+      CHECK_CUDA(cudaMallocHost((void **) &h_inputs_pinned[gpu], input_bytes));
+      CHECK_CUDA(cudaMallocHost((void **) &h_outputs_pinned[gpu], output_bytes));
       CHECK_CUDA(cudaMalloc(&d_inputs[gpu], input_bytes));
       CHECK_CUDA(cudaMalloc(&d_permute[gpu], permute_bytes));
       CHECK_CUDA(cudaMalloc(&d_concat[gpu], concat_bytes));
@@ -200,50 +206,55 @@ void predict_sentiment(int *inputs, float *outputs, size_t n_samples) {
       CHECK_CUDA(cudaMalloc(&d_linear2[gpu], linear2_bytes));
       CHECK_CUDA(cudaMalloc(&d_outputs[gpu], output_bytes));
 
-      CHECK_CUDA(cudaMemcpy(d_inputs[gpu], inputs + chunk_start[gpu] * SEQ_LEN,
-                            input_bytes, cudaMemcpyHostToDevice));
+      memcpy(h_inputs_pinned[gpu], inputs + chunk_start[gpu] * SEQ_LEN,
+             input_bytes);
+
+      CHECK_CUDA(cudaMemcpyAsync(d_inputs[gpu], h_inputs_pinned[gpu],
+                                 input_bytes, cudaMemcpyHostToDevice,
+                                 streams[gpu]));
 
       /* in [SEQ_LEN] -> out [SEQ_LEN, 4096] */
       /* in [SEQ_LEN, 4096] -> out [4096, SEQ_LEN] */
       EmbeddingPermuteBatchCUDA(d_inputs[gpu], emb_w, d_permute[gpu],
-                                batch, gpu);
+                                batch, gpu, streams[gpu]);
 
       /* in [4096, SEQ_LEN] -> out [1024, SEQ_LEN - n]  n == 2, 4, 6..*/
       /* in [1024, SEQ_LEN - 2] -> out [1024] */
       Conv1DReLUMaxBatchCUDA(d_permute[gpu], conv0_w, conv0_b, d_concat[gpu],
-                             batch, 0, gpu);
+                             batch, 0, gpu, streams[gpu]);
       Conv1DReLUMaxBatchCUDA(d_permute[gpu], conv1_w, conv1_b, d_concat[gpu],
-                             batch, N_FILTERS, gpu);
+                             batch, N_FILTERS, gpu, streams[gpu]);
       Conv1DReLUMaxBatchCUDA(d_permute[gpu], conv2_w, conv2_b, d_concat[gpu],
-                             batch, N_FILTERS * 2, gpu);
+                             batch, N_FILTERS * 2, gpu, streams[gpu]);
       Conv1DReLUMaxBatchCUDA(d_permute[gpu], conv3_w, conv3_b, d_concat[gpu],
-                             batch, N_FILTERS * 3, gpu);
+                             batch, N_FILTERS * 3, gpu, streams[gpu]);
 
       /* in [1024 * 4] -> out [2048] */
       LinearBatchCUDA(d_concat[gpu], linear0_w, linear0_b, d_linear0[gpu],
-                      batch, true, gpu);
+                      batch, true, gpu, streams[gpu]);
 
       /* in [2048] -> out [1024] */
       LinearBatchCUDA(d_linear0[gpu], linear1_w, linear1_b, d_linear1[gpu],
-                      batch, true, gpu);
+                      batch, true, gpu, streams[gpu]);
 
       /* in [1024] -> out [512] */
       LinearBatchCUDA(d_linear1[gpu], linear2_w, linear2_b, d_linear2[gpu],
-                      batch, true, gpu);
+                      batch, true, gpu, streams[gpu]);
 
       /* in [512] -> out [2] */
       LinearBatchCUDA(d_linear2[gpu], linear3_w, linear3_b, d_outputs[gpu],
-                      batch, false, gpu);
+                      batch, false, gpu, streams[gpu]);
+
+      CHECK_CUDA(cudaMemcpyAsync(h_outputs_pinned[gpu], d_outputs[gpu],
+                                 output_bytes,
+                                 cudaMemcpyDeviceToHost, streams[gpu]));
     }
 
     for (int gpu = 0; gpu < active_gpus; gpu++) {
-      size_t batch = chunk_size[gpu];
-      size_t output_bytes = batch * N_CLASSES * sizeof(float);
-
       CHECK_CUDA(cudaSetDevice(gpu));
-      CHECK_CUDA(cudaMemcpy(outputs + chunk_start[gpu] * N_CLASSES,
-                            d_outputs[gpu], output_bytes,
-                            cudaMemcpyDeviceToHost));
+      CHECK_CUDA(cudaStreamSynchronize(streams[gpu]));
+      memcpy(outputs + chunk_start[gpu] * N_CLASSES, h_outputs_pinned[gpu],
+             chunk_size[gpu] * N_CLASSES * sizeof(float));
     }
 
     for (int gpu = 0; gpu < active_gpus; gpu++) {
@@ -255,6 +266,9 @@ void predict_sentiment(int *inputs, float *outputs, size_t n_samples) {
       CHECK_CUDA(cudaFree(d_concat[gpu]));
       CHECK_CUDA(cudaFree(d_permute[gpu]));
       CHECK_CUDA(cudaFree(d_inputs[gpu]));
+      CHECK_CUDA(cudaFreeHost(h_outputs_pinned[gpu]));
+      CHECK_CUDA(cudaFreeHost(h_inputs_pinned[gpu]));
+      CHECK_CUDA(cudaStreamDestroy(streams[gpu]));
     }
 
     CHECK_CUDA(cudaSetDevice(prev_device));

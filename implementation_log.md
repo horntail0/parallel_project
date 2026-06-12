@@ -145,3 +145,53 @@
 
 - 이 단계는 아직 CUDA stream을 명시적으로 사용하지 않는다.
 - 다음 최적화 후보는 GPU별 stream을 만들어 H2D copy, kernel execution, D2H copy를 더 명확하게 overlap하는 것이다.
+
+## Step 9: GPU별 CUDA Stream 적용
+- Step 8에서는 GPU별 chunk를 나눴지만, 복사와 kernel 호출이 host loop 안에서 동기적으로 진행되는 부분이 남아 있었다.
+- 이번 단계에서는 GPU마다 `cudaStream_t`를 하나씩 생성해 각 GPU의 작업을 독립 stream에 enqueue하도록 변경했다.
+
+- `layer.h`와 `layer.cu`의 batch CUDA wrapper에 `cudaStream_t stream` 인자를 추가했다.
+  - `EmbeddingPermuteBatchCUDA(...)`
+  - `Conv1DReLUMaxBatchCUDA(...)`
+  - `LinearBatchCUDA(...)`
+- 각 wrapper 내부 kernel launch는 `<<<grid, block, 0, stream>>>` 형태로 바꿨다.
+- 이렇게 하면 `predict_sentiment(...)`에서 지정한 stream에 kernel이 들어가므로 GPU별 작업 순서를 stream 단위로 제어할 수 있다.
+
+- `predict_sentiment(...)`에서는 GPU마다 stream을 생성한다.
+  - `cudaStreamCreate(&streams[gpu])`
+- input copy는 `cudaMemcpyAsync(..., cudaMemcpyHostToDevice, streams[gpu])`로 변경했다.
+- output copy도 `cudaMemcpyAsync(..., cudaMemcpyDeviceToHost, streams[gpu])`로 변경했다.
+
+- 각 GPU stream에는 다음 순서로 작업이 들어간다.
+  - host input chunk를 `d_inputs[gpu]`로 복사
+  - Embedding/Permute batch kernel
+  - Conv/ReLU/MaxPool batch kernel 4개
+  - Linear batch kernel 4개
+  - `d_outputs[gpu]`를 host output chunk로 복사
+- 같은 stream 안에서는 순서가 보장되므로 별도 device-wide synchronize 없이도 데이터 의존성이 유지된다.
+
+- 모든 GPU의 작업을 enqueue한 뒤 `cudaStreamSynchronize(streams[gpu])`로 각 stream 완료를 기다린다.
+- 완료 후 GPU별 workspace를 해제하고 stream을 destroy한다.
+
+- host 메모리가 pinned memory가 아니면 `cudaMemcpyAsync`의 overlap 효과가 제한될 수 있다.
+- 다음 최적화 후보는 input/output host buffer를 pinned memory staging buffer로 옮겨 H2D/D2H copy와 kernel 실행의 overlap 효과를 더 키우는 것이다.
+
+## Step 10: Pinned Host Staging Buffer 적용
+- Step 9에서 `cudaMemcpyAsync`를 사용했지만, 원본 `inputs`와 `outputs`는 외부에서 전달되는 host pointer라 pinned memory라고 보장할 수 없다.
+- pageable host memory를 대상으로 한 async copy는 내부적으로 동기적인 staging이 발생할 수 있어 copy와 kernel overlap 효과가 제한될 수 있다.
+
+- 이번 단계에서는 GPU별 pinned host staging buffer를 추가했다.
+  - `h_inputs_pinned[gpu]`
+  - `h_outputs_pinned[gpu]`
+- 각 GPU chunk에 대해 `cudaMallocHost(...)`로 pinned input/output staging buffer를 할당한다.
+- 원본 `inputs` chunk는 CPU `memcpy`로 `h_inputs_pinned[gpu]`에 복사한다.
+- H2D copy는 `h_inputs_pinned[gpu] -> d_inputs[gpu]`로 수행한다.
+- D2H copy는 `d_outputs[gpu] -> h_outputs_pinned[gpu]`로 수행한다.
+
+- H2D/D2H copy는 계속 `cudaMemcpyAsync(..., streams[gpu])`를 사용한다.
+- 같은 stream 안에서 input copy, kernel들, output copy가 순서대로 실행되므로 데이터 의존성은 유지된다.
+- `cudaStreamSynchronize(streams[gpu])` 이후 pinned output staging buffer의 내용을 원래 `outputs` 위치로 CPU `memcpy`한다.
+
+- GPU별 workspace 해제 시 pinned staging buffer도 `cudaFreeHost(...)`로 해제한다.
+- 이 변경은 특히 GPU별 stream overlap과 PCIe transfer overlap을 더 잘 활용하기 위한 준비 단계다.
+- 다음 최적화 후보는 현재 매 호출마다 반복되는 `cudaMalloc/cudaFree/cudaMallocHost/cudaFreeHost` 비용을 줄이기 위해 workspace를 재사용하는 것이다.

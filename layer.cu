@@ -71,9 +71,10 @@ __global__ void EmbeddingPermuteBatchKernel(const int *inputs,
 }
 
 void EmbeddingPermuteBatchCUDA(int *d_inputs, Tensor *w, float *d_permute,
-                               size_t batch, int device_id) {
+                               size_t batch, int device_id,
+                               cudaStream_t stream) {
   size_t total = batch * EMBEDDING_DIM * SEQ_LEN;
-  EmbeddingPermuteBatchKernel<<<(total + 255) / 256, 256>>>(
+  EmbeddingPermuteBatchKernel<<<(total + 255) / 256, 256, 0, stream>>>(
       d_inputs, w->device_buf(device_id), d_permute, batch);
   CHECK_CUDA(cudaGetLastError());
 }
@@ -229,11 +230,12 @@ __global__ void Conv1DReLUMaxBatchOptimizedKernel(
 
 void Conv1DReLUMaxBatchCUDA(float *d_in, Tensor *w, Tensor *b,
                             float *d_concat, size_t batch,
-                            size_t out_offset, int device_id) {
+                            size_t out_offset, int device_id,
+                            cudaStream_t stream) {
   size_t total = batch * N_FILTERS;
   size_t K = w->shape[2]; // w의 shape는 [OC, C, K]이므로 w->shape[2]는 K가 됨.
   // OC = N_FILTERES, C = EMBEDDING_DIM, K = 3, 5, 7, or 9.
-  Conv1DReLUMaxBatchOptimizedKernel<<<total, 256>>>(
+  Conv1DReLUMaxBatchOptimizedKernel<<<total, 256, 0, stream>>>(
       d_in, w->device_buf(device_id), b->device_buf(device_id), d_concat,
       batch, K, out_offset);
   CHECK_CUDA(cudaGetLastError());
@@ -402,13 +404,14 @@ __global__ void LinearBatchKernel(const float *in, const float *w,
 }
 
 void LinearBatchCUDA(float *d_in, Tensor *w, Tensor *b, float *d_out,
-                     size_t batch, bool use_relu, int device_id) {
+                     size_t batch, bool use_relu, int device_id,
+                     cudaStream_t stream) {
   size_t M = w->shape[0];
   size_t N = w->shape[1];
   dim3 block(16, 16);
   dim3 grid((M + 15) / 16, (batch + 15) / 16);
 
-  LinearBatchKernel<<<grid, block>>>(
+  LinearBatchKernel<<<grid, block, 0, stream>>>(
       d_in, w->device_buf(device_id), b->device_buf(device_id), d_out,
       batch, M, N, use_relu);
   CHECK_CUDA(cudaGetLastError());
