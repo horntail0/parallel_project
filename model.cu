@@ -151,39 +151,14 @@ void predict_sentiment(int *inputs, float *outputs, size_t n_samples) {
       /* Load a sentence from the inputs */
       int *single_input = inputs + n * SEQ_LEN;
 
-      /* in [SEQ_LEN] -> out [SEQ_LEN, 4096] */
-      Embedding(single_input, emb_w, emb_a);
+      /* in [SEQ_LEN] -> out [4096, SEQ_LEN] */
+      EmbeddingPermute(single_input, emb_w, permute_a);
 
-      /* in [SEQ_LEN, 4096] -> out [4096, SEQ_LEN] */
-      Permute(emb_a, permute_a);
-
-      /* in [4096, SEQ_LEN] -> out [1024, SEQ_LEN - 2] */
-      Conv1D(permute_a, conv0_w, conv0_b, conv0_a);
-      ReLU(conv0_a);
-
-      /* in [1024, SEQ_LEN - 2] -> out [1024] */
-      GetMax(conv0_a, pool0_a);
-
-      /* in [4096, SEQ_LEN] -> out [1024, SEQ_LEN - 4] */
-      Conv1D(permute_a, conv1_w, conv1_b, conv1_a);
-      ReLU(conv1_a);
-
-      /* in [1024, SEQ_LEN - 4] -> out [1024] */
-      GetMax(conv1_a, pool1_a);
-
-      /* in [4096, SEQ_LEN] -> out [1024, SEQ_LEN - 6] */
-      Conv1D(permute_a, conv2_w, conv2_b, conv2_a);
-      ReLU(conv2_a);
-
-      /* in [1024, SEQ_LEN - 6] -> out [1024] */
-      GetMax(conv2_a, pool2_a);
-
-      /* in [4096, SEQ_LEN] -> out [1024, SEQ_LEN - 8] */
-      Conv1D(permute_a, conv3_w, conv3_b, conv3_a);
-      ReLU(conv3_a);
-
-      /* in [1024, SEQ_LEN - 8] -> out [1024] */
-      GetMax(conv3_a, pool3_a);
+      /* in [4096, SEQ_LEN] -> out [1024] */
+      Conv1DReLUMax(permute_a, conv0_w, conv0_b, pool0_a);
+      Conv1DReLUMax(permute_a, conv1_w, conv1_b, pool1_a);
+      Conv1DReLUMax(permute_a, conv2_w, conv2_b, pool2_a);
+      Conv1DReLUMax(permute_a, conv3_w, conv3_b, pool3_a);
 
       /* in [1024] +
             [1024] +
@@ -192,16 +167,13 @@ void predict_sentiment(int *inputs, float *outputs, size_t n_samples) {
       Concat(pool0_a, pool1_a, pool2_a, pool3_a, concat_a);
 
       /* in [1024 * 4] -> out [2048] */
-      Linear(concat_a, linear0_w, linear0_b, linear0_a);
-      ReLU(linear0_a);
+      LinearReLU(concat_a, linear0_w, linear0_b, linear0_a);
 
       /* in [2048] -> out [1024] */
-      Linear(linear0_a, linear1_w, linear1_b, linear1_a);
-      ReLU(linear1_a);
+      LinearReLU(linear0_a, linear1_w, linear1_b, linear1_a);
 
       /* in [1024] -> out [512] */
-      Linear(linear1_a, linear2_w, linear2_b, linear2_a);
-      ReLU(linear2_a);
+      LinearReLU(linear1_a, linear2_w, linear2_b, linear2_a);
 
       /* in [512] -> out [2] */
       Linear(linear2_a, linear3_w, linear3_b, linear3_a);

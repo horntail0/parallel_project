@@ -34,6 +34,22 @@ void Permute(Tensor *in, Tensor *out) {
   }
 }
 
+/* Fused Embedding + Permute
+ * @param [in1]  in: [s]
+ * @param [in2]   w: [NUM_VOCAB, H]
+ * @param [out] out: [H, s]
+ */
+void EmbeddingPermute(int *in, Tensor *w, Tensor *out) {
+  size_t H = out->shape[0];
+  size_t s = out->shape[1];
+
+  for (size_t i = 0; i < s; i++) {
+    for (size_t j = 0; j < H; j++) {
+      out->buf[j * s + i] = w->buf[in[i] * H + j];
+    }
+  }
+}
+
 /* Conv1D
  * @param [in1]  in: [C, s]
  * @param [in2]   w: [OC, C, K]
@@ -72,6 +88,36 @@ void Conv1D(Tensor *in, Tensor *w, Tensor *b, Tensor *out) {
       }
       out->buf[i * os + j] = val + b->buf[i];
     }
+  }
+}
+
+/* Fused Conv1D + ReLU + GetMax
+ * @param [in1]  in: [C, s]
+ * @param [in2]   w: [OC, C, K]
+ * @param [in3]   b: [OC]
+ * @param [out] out: [OC]
+ */
+void Conv1DReLUMax(Tensor *in, Tensor *w, Tensor *b, Tensor *out) {
+  size_t s = in->shape[1];
+  size_t C = in->shape[0];
+  size_t OC = w->shape[0];
+  size_t K = w->shape[2];
+  size_t os = s - K + 1;
+
+  for (size_t i = 0; i < OC; i++) {
+    float max_val = 0.f;
+    for (size_t j = 0; j < os; j++) {
+      float val = 0.f;
+      for (size_t k = 0; k < C; k++) {
+        for (size_t l = 0; l < K; l++) {
+          val += in->buf[k * s + j + l] *
+                 w->buf[i * C * K + k * K + l];
+        }
+      }
+      val += b->buf[i];
+      if (val > max_val) max_val = val;
+    }
+    out->buf[i] = max_val;
   }
 }
 
@@ -180,5 +226,25 @@ void Linear(Tensor *in, Tensor *w, Tensor *b, Tensor *out) {
       val += in->buf[j] * w->buf[i * N + j];
     }
     out->buf[i] = val + b->buf[i];
+  }
+}
+
+/* Fused Linear + ReLU
+ * @param [in1]  in: [N]
+ * @param [in2]   w: [M, N]
+ * @param [in3]   b: [M]
+ * @param [out] out: [M]
+ */
+void LinearReLU(Tensor *in, Tensor *w, Tensor *b, Tensor *out) {
+  size_t N = in->shape[0];
+  size_t M = w->shape[0];
+
+  for (size_t i = 0; i < M; i++) {
+    float val = 0.f;
+    for (size_t j = 0; j < N; j++) {
+      val += in->buf[j] * w->buf[i * N + j];
+    }
+    val += b->buf[i];
+    out->buf[i] = val > 0.f ? val : 0.f;
   }
 }
