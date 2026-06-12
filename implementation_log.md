@@ -54,3 +54,34 @@
   - `d_linear2 -> d_outputs` without ReLU
 - `predict_sentiment(...)` 안의 `n_samples` loop가 제거되었다.
 - 최종 `[n_samples, N_CLASSES]` output만 host `outputs`로 복사한다.
+
+## Step 6: Conv Batch Kernel Block Reduction 최적화
+
+- 기존 `Conv1DReLUMaxBatchKernel`은 thread 하나가 `[sample, output_channel]` 하나를 맡았다.
+- 그 thread 하나가 `EMBEDDING_DIM * K * os`에 해당하는 곱셈/덧셈을 전부 직렬로 수행했다.
+- 이 구조는 GPU thread 수는 많아 보여도, 각 thread 내부 일이 너무 커서 실제 병렬성이 부족했다.
+
+- `Conv1DReLUMaxBatchOptimizedKernel`을 추가했다.
+- 새 커널은 block 하나가 `[sample, output_channel]` 하나를 맡도록 바꿨다.
+- block 안에는 256 threads를 두었다.
+- 각 thread는 `EMBEDDING_DIM * K` dot product의 일부를 strided 방식으로 나눠 계산한다.
+  - 예: thread `t`는 `t`, `t + blockDim.x`, `t + 2 * blockDim.x` 위치의 항을 담당한다.
+  - 이 방식은 일반적인 matrix tiling이라기보다 dot product work partitioning에 가깝다.
+
+- 각 thread가 계산한 partial sum은 shared memory 배열 `partial[256]`에 저장한다.
+- 이후 block 내부에서 shared memory reduction을 수행한다.
+  - stride를 `128 -> 64 -> 32 -> ... -> 1`로 줄이며 partial sum을 합친다.
+  - 매 reduction 단계마다 `__syncthreads()`로 block 내 thread 동기화를 보장한다.
+- reduction이 끝나면 `partial[0]`에 해당 `pos`의 conv 결과가 모인다.
+
+- `threadIdx.x == 0`인 thread가 bias를 더하고 ReLU+MaxPool을 적용한다.
+  - ReLU 효과를 위해 max 초기값은 `0.f`로 유지한다.
+  - 각 `pos`의 conv 결과 중 최대값을 `max_val`에 저장한다.
+- 모든 `pos` 처리가 끝나면 thread 0이 `d_concat[b, offset + oc]`에 최종 pooled 값을 쓴다.
+
+- `Conv1DReLUMaxBatchCUDA(...)` wrapper는 이제 기존 naive kernel 대신 optimized kernel을 호출한다.
+- 아직 적용하지 않은 최적화:
+  - weight/input tile을 shared memory에 캐싱하는 진짜 tiled convolution
+  - warp-level reduction
+  - branch 4개를 하나의 kernel로 합치는 fusion
+  - Tensor Core 또는 vectorized load 활용

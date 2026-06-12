@@ -179,13 +179,61 @@ __global__ void Conv1DReLUMaxBatchKernel(const float *in, const float *w,
   concat[sample * (N_FILTERS * 4) + out_offset + oc] = max_val;
 }
 
+__global__ void Conv1DReLUMaxBatchOptimizedKernel(
+    const float *in, const float *w, const float *bias, float *concat,
+    size_t batch, size_t K, size_t out_offset) {
+  __shared__ float partial[256];
+
+  size_t idx = blockIdx.x;
+  size_t total = batch * N_FILTERS;
+  if (idx >= total) return;
+
+  size_t sample = idx / N_FILTERS;
+  size_t oc = idx % N_FILTERS;
+  size_t os = SEQ_LEN - K + 1;
+  size_t filter_size = EMBEDDING_DIM * K;
+  float max_val = 0.f;
+
+  for (size_t pos = 0; pos < os; pos++) {
+    float thread_sum = 0.f;
+
+    for (size_t t = threadIdx.x; t < filter_size; t += blockDim.x) {
+      size_t c = t / K;
+      size_t k = t % K;
+      thread_sum +=
+          in[sample * EMBEDDING_DIM * SEQ_LEN + c * SEQ_LEN + pos + k] *
+          w[oc * EMBEDDING_DIM * K + c * K + k];
+    }
+
+    partial[threadIdx.x] = thread_sum;
+    __syncthreads();
+
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        partial[threadIdx.x] += partial[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+      float val = partial[0] + bias[oc];
+      if (val > max_val) max_val = val;
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    concat[sample * (N_FILTERS * 4) + out_offset + oc] = max_val;
+  }
+}
+
 void Conv1DReLUMaxBatchCUDA(float *d_in, Tensor *w, Tensor *b,
                             float *d_concat, size_t batch,
                             size_t out_offset, int device_id) {
   size_t total = batch * N_FILTERS;
   size_t K = w->shape[2]; // w의 shape는 [OC, C, K]이므로 w->shape[2]는 K가 됨.
   // OC = N_FILTERES, C = EMBEDDING_DIM, K = 3, 5, 7, or 9.
-  Conv1DReLUMaxBatchKernel<<<(total + 255) / 256, 256>>>(
+  Conv1DReLUMaxBatchOptimizedKernel<<<total, 256>>>(
       d_in, w->device_buf(device_id), b->device_buf(device_id), d_concat,
       batch, K, out_offset);
   CHECK_CUDA(cudaGetLastError());
