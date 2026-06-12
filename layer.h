@@ -20,6 +20,8 @@ void Concat(Tensor *in1, Tensor *in2, Tensor *in3, Tensor *in4,
             Tensor *out);
 void Linear(Tensor *in, Tensor *w, Tensor *b, Tensor *out);
 void LinearReLU(Tensor *in, Tensor *w, Tensor *b, Tensor *out);
+void LinearBatchCUDA(float *d_in, Tensor *w, Tensor *b, float *d_out,
+                     size_t batch, bool use_relu, int device_id);
 
 /* Example of using CUDA kernel */
 void ReLU_CUDA(Tensor *inout);

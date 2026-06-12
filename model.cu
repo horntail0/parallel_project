@@ -157,16 +157,26 @@ void predict_sentiment(int *inputs, float *outputs, size_t n_samples) {
     int *d_inputs = nullptr;
     float *d_permute = nullptr;
     float *d_concat = nullptr;
-    float *concat_batch = nullptr;
+    float *d_linear0 = nullptr;
+    float *d_linear1 = nullptr;
+    float *d_linear2 = nullptr;
+    float *d_outputs = nullptr;
 
     size_t input_bytes = n_samples * SEQ_LEN * sizeof(int);
     size_t permute_bytes = n_samples * EMBEDDING_DIM * SEQ_LEN * sizeof(float);
     size_t concat_bytes = n_samples * N_FILTERS * 4 * sizeof(float);
+    size_t linear0_bytes = n_samples * 2048 * sizeof(float);
+    size_t linear1_bytes = n_samples * 1024 * sizeof(float);
+    size_t linear2_bytes = n_samples * 512 * sizeof(float);
+    size_t output_bytes = n_samples * N_CLASSES * sizeof(float);
 
     CHECK_CUDA(cudaMalloc(&d_inputs, input_bytes));
     CHECK_CUDA(cudaMalloc(&d_permute, permute_bytes));
     CHECK_CUDA(cudaMalloc(&d_concat, concat_bytes));
-    CHECK_CUDA(cudaMallocHost((void **) &concat_batch, concat_bytes));
+    CHECK_CUDA(cudaMalloc(&d_linear0, linear0_bytes));
+    CHECK_CUDA(cudaMalloc(&d_linear1, linear1_bytes));
+    CHECK_CUDA(cudaMalloc(&d_linear2, linear2_bytes));
+    CHECK_CUDA(cudaMalloc(&d_outputs, output_bytes));
 
     CHECK_CUDA(cudaMemcpy(d_inputs, inputs, input_bytes,
                           cudaMemcpyHostToDevice));
@@ -185,36 +195,30 @@ void predict_sentiment(int *inputs, float *outputs, size_t n_samples) {
                            n_samples, N_FILTERS * 2, 0);
     Conv1DReLUMaxBatchCUDA(d_permute, conv3_w, conv3_b, d_concat,
                            n_samples, N_FILTERS * 3, 0);
-    CHECK_CUDA(cudaMemcpy(concat_batch, d_concat, concat_bytes,
+
+    /* in [1024 * 4] -> out [2048] */
+    LinearBatchCUDA(d_concat, linear0_w, linear0_b, d_linear0,
+                    n_samples, true, 0);
+
+    /* in [2048] -> out [1024] */
+    LinearBatchCUDA(d_linear0, linear1_w, linear1_b, d_linear1,
+                    n_samples, true, 0);
+
+    /* in [1024] -> out [512] */
+    LinearBatchCUDA(d_linear1, linear2_w, linear2_b, d_linear2,
+                    n_samples, true, 0);
+
+    /* in [512] -> out [2] */
+    LinearBatchCUDA(d_linear2, linear3_w, linear3_b, d_outputs,
+                    n_samples, false, 0);
+
+    CHECK_CUDA(cudaMemcpy(outputs, d_outputs, output_bytes,
                           cudaMemcpyDeviceToHost));
 
-    /* Linear layers are still computed on CPU for a clear validation point. */
-    for (size_t n = 0; n < n_samples; n++) {
-      memcpy(concat_a->buf, concat_batch + n * N_FILTERS * 4,
-             N_FILTERS * 4 * sizeof(float));
-
-      /* in [1024 * 4] -> out [2048] */
-      LinearReLU(concat_a, linear0_w, linear0_b, linear0_a);
-
-      /* in [2048] -> out [1024] */
-      LinearReLU(linear0_a, linear1_w, linear1_b, linear1_a);
-
-      /* in [1024] -> out [512] */
-      LinearReLU(linear1_a, linear2_w, linear2_b, linear2_a);
-
-      /* in [512] -> out [2] */
-      Linear(linear2_a, linear3_w, linear3_b, linear3_a);
-
-      /* The output 'linear3_a' (shape: [2]) contains the probabilities 
-        for each sentiment class (0: negative, 1: positive). To determine 
-        the sentiment, we can simply take the argmax of these probabilities. 
-      */
-
-      /* Copy the computation result to the outputs */
-      memcpy(outputs + n * 2, linear3_a->buf, 2 * sizeof(float));
-    }
-
-    CHECK_CUDA(cudaFreeHost(concat_batch));
+    CHECK_CUDA(cudaFree(d_outputs));
+    CHECK_CUDA(cudaFree(d_linear2));
+    CHECK_CUDA(cudaFree(d_linear1));
+    CHECK_CUDA(cudaFree(d_linear0));
     CHECK_CUDA(cudaFree(d_concat));
     CHECK_CUDA(cudaFree(d_permute));
     CHECK_CUDA(cudaFree(d_inputs));

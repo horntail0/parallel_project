@@ -318,3 +318,36 @@ void LinearReLU(Tensor *in, Tensor *w, Tensor *b, Tensor *out) {
     out->buf[i] = val > 0.f ? val : 0.f;
   }
 }
+
+__global__ void LinearBatchKernel(const float *in, const float *w,
+                                  const float *bias, float *out,
+                                  size_t batch, size_t M, size_t N,
+                                  bool use_relu) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = batch * M;
+  if (idx >= total) return;
+
+  size_t sample = idx / M;
+  size_t row = idx % M;
+  float val = 0.f;
+
+  for (size_t col = 0; col < N; col++) {
+    val += in[sample * N + col] * w[row * N + col];
+  }
+  val += bias[row];
+
+  if (use_relu && val < 0.f) val = 0.f;
+  out[idx] = val;
+}
+
+void LinearBatchCUDA(float *d_in, Tensor *w, Tensor *b, float *d_out,
+                     size_t batch, bool use_relu, int device_id) {
+  size_t M = w->shape[0];
+  size_t N = w->shape[1];
+  size_t total = batch * M;
+
+  LinearBatchKernel<<<(total + 255) / 256, 256>>>(
+      d_in, w->device_buf(device_id), b->device_buf(device_id), d_out,
+      batch, M, N, use_relu);
+  CHECK_CUDA(cudaGetLastError());
+}
