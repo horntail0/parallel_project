@@ -371,30 +371,44 @@ __global__ void LinearBatchKernel(const float *in, const float *w,
                                   const float *bias, float *out,
                                   size_t batch, size_t M, size_t N,
                                   bool use_relu) {
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t total = batch * M;
-  if (idx >= total) return;
+  __shared__ float in_tile[16][16];
+  __shared__ float w_tile[16][16];
 
-  size_t sample = idx / M;
-  size_t row = idx % M;
+  size_t sample = blockIdx.y * 16 + threadIdx.y;
+  size_t row = blockIdx.x * 16 + threadIdx.x;
   float val = 0.f;
 
-  for (size_t col = 0; col < N; col++) {
-    val += in[sample * N + col] * w[row * N + col];
-  }
-  val += bias[row];
+  for (size_t tile = 0; tile < N; tile += 16) {
+    size_t col_for_in = tile + threadIdx.x;
+    size_t col_for_w = tile + threadIdx.y;
 
-  if (use_relu && val < 0.f) val = 0.f;
-  out[idx] = val;
+    in_tile[threadIdx.y][threadIdx.x] =
+        (sample < batch && col_for_in < N) ? in[sample * N + col_for_in] : 0.f;
+    w_tile[threadIdx.y][threadIdx.x] =
+        (row < M && col_for_w < N) ? w[row * N + col_for_w] : 0.f;
+    __syncthreads();
+
+    for (size_t k = 0; k < 16; k++) {
+      val += in_tile[threadIdx.y][k] * w_tile[k][threadIdx.x];
+    }
+    __syncthreads();
+  }
+
+  if (sample < batch && row < M) {
+    val += bias[row];
+    if (use_relu && val < 0.f) val = 0.f;
+    out[sample * M + row] = val;
+  }
 }
 
 void LinearBatchCUDA(float *d_in, Tensor *w, Tensor *b, float *d_out,
                      size_t batch, bool use_relu, int device_id) {
   size_t M = w->shape[0];
   size_t N = w->shape[1];
-  size_t total = batch * M;
+  dim3 block(16, 16);
+  dim3 grid((M + 15) / 16, (batch + 15) / 16);
 
-  LinearBatchKernel<<<(total + 255) / 256, 256>>>(
+  LinearBatchKernel<<<grid, block>>>(
       d_in, w->device_buf(device_id), b->device_buf(device_id), d_out,
       batch, M, N, use_relu);
   CHECK_CUDA(cudaGetLastError());
